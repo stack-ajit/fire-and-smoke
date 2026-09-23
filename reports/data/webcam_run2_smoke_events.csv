@@ -1,0 +1,15 @@
+frame,time_s,event,class,score,x1,y1,x2,y2,detail
+94,87.05,ALARM_ON,smoke,0.441,763,6,1167,207,3/8 hits
+95,87.94,ALARM_ON,smoke,0.401,834,4,1090,259,3/8 hits
+103,96.04,ALARM_OFF,,,,,,,track 5
+104,97.02,ALARM_OFF,,,,,,,track 4
+109,102.06,ALARM_ON,smoke,0.499,755,1,1021,228,3/8 hits
+113,105.82,ALARM_ON,smoke,0.338,750,2,1246,270,3/8 hits
+123,115.22,ALARM_ON,smoke,0.422,1020,0,1275,212,3/8 hits
+126,118.13,ALARM_OFF,,,,,,,track 5
+129,121.12,ALARM_OFF,,,,,,,track 4
+145,136.56,ALARM_ON,smoke,0.325,549,4,1238,224,3/8 hits
+146,137.59,ALARM_OFF,,,,,,,track 7
+156,147.64,ALARM_OFF,,,,,,,track 4
+165,156.52,ALARM_ON,smoke,0.511,700,4,1073,239,3/8 hits
+194,184.75,ALARM_OFF,,,,,,,track 4

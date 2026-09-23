@@ -418,6 +418,220 @@ batched GPU worker. A fire alarm on 30-second-old video is worse than no alarm.
 
 ---
 
+## 6c. A lighter, deployable model
+
+Prompted on 2026-09-17 by an external review recommending the standard
+multi-camera path: `DINOv3 -> ONNX -> TensorRT fp16 -> batched inference ->
+DeepStream`. The direction is right. It skipped a blocker, which was measured
+before building anything.
+
+### The blocker: Faster R-CNN cannot be batch-exported
+
+That whole path depends on running many cameras' frames as **one batch**.
+
+| exporter | batch 1 | batch 4 |
+|---|---|---|
+| legacy TorchScript ONNX | works | **fails** in ONNX Runtime (`Split` node: batch size baked in) |
+| `torch.export` (current) | **fails** at step 1 | - |
+
+The cause is structural. Faster R-CNN has a data-dependent middle: the RPN picks
+a variable number of proposals, and RoIAlign crops features for exactly those
+before the box head runs. There is no fixed-shape point at which to cut the
+graph. No amount of TensorRT tuning gets past that.
+
+### The fix: a one-stage FCOS head
+
+FCOS puts every learned layer *before* anything data-dependent. The network
+ends at fixed-shape tensors (`8500` locations at 640 px); decoding and NMS
+happen afterwards. Implemented with torchvision's FCOS, so the loss (focal +
+GIoU + centerness) is well-tested code, not hand-rolled.
+
+`num_classes` stays 3 with an unused background channel, so label ids (1 =
+smoke, 2 = fire) match the old model and every evaluation, video and report
+script works unchanged. Old Faster R-CNN checkpoints still load.
+
+### Measured: the head alone does not make it lighter
+
+At 640 px on CPU, same ViT-S trunk:
+
+| config | ms/frame | params | vs current |
+|---|---|---|---|
+| ViT-S + Faster R-CNN (current) | 884 | 39.3M | 1.00x |
+| ViT-S + FCOS, 4 convs | 1177 | - | 0.86x |
+| ViT-S + FCOS, 2 convs | 924 | 27.2M | 0.96x |
+| ViT-S + FCOS, 2 convs, 128ch pyramid | 746 | 23.2M | 1.19x |
+| **ViT-Ti + FCOS, 2 convs** | **491** | **10.8M** | **1.80x** |
+| **ViT-Ti + FCOS, 2 convs, 128ch pyramid** | **329** | **6.9M** | **2.69x** |
+
+The dense FCOS head convolves every location of the 80x80 map, which costs
+about what Faster R-CNN's sparse RoI head does. **The head swap makes the model
+deployable, not lighter.** The trunk is ~67% of compute, so the real lever is
+the trunk: pretrained DINOv3 ViT-Ti (`vit_tiny_patch16_dinov3_qkvb.eupe_lvd1689m`,
+5.5M params, same normalisation) is available in timm.
+
+Resolution was *not* touched. 640 -> 448 was measured in 6b to cost 24 points
+of recall, and that rule still stands.
+
+### Measured: ONNX Runtime on CPU is not a speedup
+
+Light model, PyTorch vs ONNX Runtime on CPU: ORT runs at **0.71-0.80x**.
+The export's value is as the input to **TensorRT fp16 on a GPU**, where
+batching and fp16 kernels are. That speedup could not be measured on this
+machine and no number is claimed for it.
+
+### Verified before any GPU time was spent
+
+- **It learns.** Overfit on 4 images with real pretrained ViT-Ti weights:
+  loss 3.57 -> 0.55, 4/5 boxes matched at IoU>=0.5 and conf>=0.5, scene head
+  exact. (Faster R-CNN managed 5/5 on the same test.)
+  `bbox_ctrness` plateaus at ~0.49 and never reaches zero. **That is correct**:
+  centerness is BCE against soft targets, so its floor is the targets' own
+  entropy. Not a training failure.
+- **Batched export is exact.** `scripts/export_onnx.py` exports with a dynamic
+  batch and checks two things on every run: raw tensors match (1e-5), and
+  boxes *decoded* from the ONNX outputs match the PyTorch model's own
+  detections - box error 6e-5 px on 80 detections at batch 4. The second check
+  is the one that matters; matching tensors are worthless if decoding is wrong.
+  Detection comparison runs with the score threshold at 0 so it cannot pass
+  vacuously.
+- **The real scripts run end to end**: train -> evaluate -> export, with both
+  heads, and Faster R-CNN's loss columns are unchanged.
+
+### What is not known yet
+
+**Accuracy.** A half-width trunk could cost small-object sensitivity the way
+downscaling did. The light model has to be trained on D-Fire and evaluated on
+the same test split, and accepted only if recall at the ~0.7% FPR operating
+point holds up against the current 0.8748.
+
+### On the external review
+
+Agreed with, and consistent with 6b: sample 2-5 fps per camera rather than
+every frame; batch across cameras; lean on temporal confirmation; benchmark on
+the target GPU before claiming a camera count; describe it as a "scalable
+architecture" rather than asserting 70-camera capacity.
+
+Two corrections:
+
+- The `3/8` temporal setting was a webcam test value chosen for a ~1 fps CPU
+  loop. Deployment defaults are `6-of-15` at conf 0.85-0.90. The review's
+  example of hits at 0.42-0.51 raising an alarm would not happen at deployment
+  thresholds.
+- DeepStream consumes a TensorRT engine through `nvinfer`, which needs a custom
+  output parser for a two-head FCOS + scene model. That is real engineering. A
+  Python batching service over ONNX Runtime-GPU or TensorRT is the realistic
+  project-stage target; DeepStream is the production target.
+
+---
+
+## 6d. First test on real customer-site footage
+
+Industrial footage from the customer, 3 fixed cameras, 54.5 minutes of normal
+working operation, **no fire**. Kept out of the repository (confidential; this
+repo is public); details and snapshots live only in the ignored `Industry/`
+folder. Scanned locally with the stage-2 model at 1 fps sampling, 15-frame
+confirmation window.
+
+| confidence | enter hits | false alarms | per hour |
+|---|---|---|---|
+| 0.50 | 6 | 19 | 20.9 |
+| 0.60 | 6 | 9 | 9.9 |
+| 0.70 | 6 | 3 | 3.3 |
+| 0.75 | 6 | **0** | **0** |
+| 0.85 | 6 | **0** | **0** |
+| 0.90 | 6 | **0** | **0** |
+
+**At the deployment thresholds (0.85-0.90) there were zero false alarms.**
+The lowest clean setting is 0.75 with 6-of-15. The still-image operating point
+chose 0.90, so there is some real margin.
+
+What fires below that, from the saved snapshots:
+
+- **"smoke" on bright, dusty haze** under roof lighting - large boxes in the
+  same upper region of one camera (0.52-0.69).
+- **"fire" on a worker's yellow hard hat** in another camera - a second
+  worker crouching in roughly the same place, so the three highest-scoring
+  alarms (0.74-0.77) land on the same spot 15 minutes apart. First read as a
+  fixed object; the side-by-side demo frame (2026-09-19) showed it is a helmet.
+
+Both are **stationary**, which is exactly the case temporal confirmation cannot
+filter (see the webcam finding in 6b).
+
+The hard hat matters most, because it generalises: every industrial camera sees
+yellow and orange helmets and hi-vis vests. It is the highest-scoring false
+positive in the footage, still below the 0.85 threshold, and it is a confuser
+class the model must learn rather than a location to hide. The fixes, in
+preference order:
+
+1. **Hard-negative mining.** Add frames from this footage to training with
+   empty labels. Best fix, since it teaches the model rather than hiding a
+   region. This footage is the only in-domain negative data the project has.
+2. **Per-camera thresholds.** A camera looking at permanent haze can run
+   higher than one that does not.
+3. **Ignore masks - rarely.** Not for the hard hat: people work there, and a
+   mask would hide a real fire at the same spot. Not for the upper region of a
+   shed either: smoke rises, and that is where it would first appear. Masks are
+   for genuinely permanent hot or bright fixtures only.
+
+**Limits:** a clean result is necessary but not sufficient. This footage says
+nothing about recall, and 54.5 minutes from 3 cameras is a small sample next to
+70 cameras running around the clock.
+
+---
+
+## 6e. Model 2 trained: the light model's accuracy cost
+
+Model 2 = DINOv3 ViT-Ti + FCOS (2 convs, 128-ch pyramid), trunk frozen, 45
+epochs on the same D-Fire split, augmentation, optimiser and schedule as
+Model 1. Best val mAP@0.5 0.6220 at epoch 44; ~7.8 min/epoch against Model 1's
+~11. Full comparison in `reports/Model1_vs_Model2_Comparison.pdf`, generated by
+`scripts/build_model_comparison_pdf.py`.
+
+| test split | Model 1 | Model 2 | change |
+|---|---|---|---|
+| mAP@0.5 | 0.7261 | 0.6125 | -0.114 |
+| smoke AP50 | 0.8146 | 0.7158 | -0.099 |
+| fire AP50 | 0.6377 | 0.5092 | -0.129 |
+| fire AP75 | 0.2363 | 0.1404 | -0.096 |
+| recall at 0.7% FPR (interp.) | 0.875 | 0.763 | -11 pts |
+| recall at 1.0% FPR (interp.) | 0.899 | 0.831 | -7 pts |
+| CPU ms/frame | 891 | 336 | 2.65x faster |
+
+**Verdict: not a drop-in replacement.** Model 2 is faster, 5.7x smaller and
+batch-exportable, and it pays for that with ~11 points of recall at Model 1's
+operating point. Model 1 stays the accuracy reference.
+
+### Its scores live on a different scale
+
+FCOS scores a box as `sqrt(sigmoid(cls) * sigmoid(centerness))`, and
+centerness rarely nears 1, so the scores compress. Model 2 has essentially no
+detections above 0.75: **at Model 1's 0.90 threshold its recall is exactly
+zero**. The two models must be compared at matched false-alarm rate, never at a
+shared threshold. Consequences acted on:
+
+- `compare_models.py` now takes a threshold per model (`LABEL=WEIGHTS@CONF`);
+  a shared 0.85 would have made Model 2 look silent in the demo.
+- Any site-footage result for Model 2 at 0.85 would be trivially zero and
+  meaningless; its operating point is 0.55.
+- The threshold sweep moved from 0.05 to 0.025 steps. At 0.05, one step moved
+  Model 2's recall 0.865 -> 0.729, so the picked operating point (0.55, 0.55%
+  FPR) was far from the best available; the PDF interpolates on the curve.
+
+### What was not controlled
+
+Two things changed at once - a smaller trunk *and* a different head - and
+Model 1 got a stage-2 unfreeze that Model 2 has not. Next experiments, cheapest
+first:
+
+1. **Model 2 stage 2** (unfreeze last 2 blocks, 15 epochs). It trains only
+   1.5M parameters frozen vs Model 1's 17.7M, so it should gain more than
+   Model 1's +0.009.
+2. **ViT-S + FCOS** - separates head from trunk. Keeps batched export at about
+   Model 1's speed; if accuracy holds, the speed can come from TensorRT and
+   batching rather than a smaller trunk.
+
+---
+
 ## 7. Change log
 
 ### 2026-09-06 — DINOv3 pipeline completed
