@@ -18,3 +18,13 @@ output/pdf/*.png
 Industry/
 *.mov
 *.dav
+
+*.zip
+*.jpg
+*.png
+*.mp4
+*.avi
+datasets/
+youtube_frames/
+data_videos/
+output/
